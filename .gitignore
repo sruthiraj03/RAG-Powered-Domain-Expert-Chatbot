@@ -1,1 +1,8 @@
 .env
+
+# Local vector DB / embeddings
+data/chroma/
+
+# Virtual environment
+.venv/
+venv/
