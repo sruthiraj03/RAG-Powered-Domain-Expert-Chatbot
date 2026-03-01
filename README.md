@@ -199,9 +199,6 @@ Example format:
 Ticker: EW  
 Section: Item 1A Risk Factors  
 
-Text:  
-...
-Also builds citation metadata.
 ---
 
 ### Step 9 — Answer Generation
