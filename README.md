@@ -47,7 +47,7 @@ Allows users to restart the conversation.
 ### Company Filter
 Users can select a single company ticker.
 Example:
-EW — Edwards Lifesciences
+EW - Edwards Lifesciences
 If no company is selected:
 All companies
 Then retrieval searches across all filings.
@@ -70,7 +70,7 @@ Example signals:
 - regulatory risk
 
 If detected, the system prioritizes:
-Item 1A — Risk Factors
+Item 1A - Risk Factors
 
 ---
 
@@ -105,7 +105,7 @@ Responsibilities:
 ## Application Flow
 ### Step 1 — Initialization
 
-The application loads environment variables from the `.env` file.
+The application loads environment variables from the .env file.
 Then initializes:
 - OpenAI client
 - Chroma collection
@@ -220,7 +220,7 @@ Dexcom develops glucose monitoring systems [1].
 Sources displayed under: Sources (Evidence Used)
 
 Example:
-[1] Dexcom — 2024 Form 10-K — Item 1 Business
+[1] Dexcom - 2024 Form 10-K - Item 1 Business
 Sources are deduplicated by ticker and year.
 
 ---
