@@ -43,61 +43,141 @@ import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
 
-try:
-    from openai import RateLimitError
-except Exception:
-    RateLimitError = Exception
-
-
 # =============================================================================
-# SECTION 1 — EDGAR PARSING
+# SECTION 1 — FILE READING + EDGAR PARSING
 # =============================================================================
 
-def load_full_submission_text(txt_path: Path) -> str:
-    return txt_path.read_text(errors="ignore")
+def read_text(path: Path) -> str:
+    return path.read_text(errors="ignore")
 
 
-def extract_document_block(full_submission: str, doc_type: str = "10-K") -> Optional[str]:
+def html_to_text(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n")
+    text = re.sub(r"\r", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def looks_like_xbrl_noise(text: str) -> bool:
+    """Detect XBRL linkbase / schema / label junk."""
+    t = text.lower()
+    return (
+        "<link:label" in t
+        or "<xbrl" in t
+        or "http://www.xbrl.org" in t
+        or "link:labelarc" in t
+        or "xlink:href" in t
+    )
+
+
+def extract_all_document_blocks(full_submission: str) -> List[str]:
+    """Split into raw <DOCUMENT> blocks."""
     parts = full_submission.split("<DOCUMENT>")
-    target = f"<TYPE>{doc_type}".upper()
+    blocks = []
+    for part in parts[1:]:
+        blocks.append("<DOCUMENT>" + part)
+    return blocks
 
-    for part in parts:
-        if target in part.upper():
-            return "<DOCUMENT>" + part
-    return None
+
+def get_doc_type(doc_block: str) -> str:
+    m = re.search(r"(?is)<TYPE>\s*([^\s<]+)", doc_block)
+    return (m.group(1).strip() if m else "").upper()
 
 
 def extract_text_from_document_block(doc_block: str) -> str:
+    """Extract <TEXT> content; if HTML, convert to clean text."""
     m = re.search(r"(?is)<TEXT>(.*)</TEXT>", doc_block)
     content = m.group(1) if m else doc_block
 
     looks_like_html = bool(re.search(r"(?i)<html|<div|<p|<table|<span", content))
-
     if looks_like_html:
-        soup = BeautifulSoup(content, "lxml")
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        text = soup.get_text(separator="\n")
-    else:
-        text = content
+        return html_to_text(content)
 
+    # Plain-text cleanup
+    text = content
     text = re.sub(r"\r", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
-
     return text.strip()
 
 
+def extract_best_10k_text_from_full_submission(full_submission: str) -> Optional[str]:
+    """
+    Instead of grabbing the first <TYPE>10-K, we:
+    - collect all doc blocks whose TYPE starts with "10-K" (or equals 10K)
+    - score them by:
+        + big size
+        + looks like HTML
+        - penalize XBRL/linkbase noise
+    - choose best
+    """
+    blocks = extract_all_document_blocks(full_submission)
+    candidates = []
+    for b in blocks:
+        dtype = get_doc_type(b)
+        if dtype in {"10-K", "10K", "10-K/A", "10KA"} or dtype.startswith("10-K"):
+            candidates.append(b)
+
+    if not candidates:
+        return None
+
+    best_text = None
+    best_score = -1
+
+    for b in candidates:
+        # Prefer ones whose TEXT looks HTML-ish
+        m = re.search(r"(?is)<TEXT>(.*)</TEXT>", b)
+        content = m.group(1) if m else b
+        is_html = bool(re.search(r"(?i)<html|<div|<p|<table|<span", content))
+
+        text = extract_text_from_document_block(b)
+        if not text:
+            continue
+
+        score = len(text)
+        if is_html:
+            score += 25000  # strong bias to HTML filing text
+        if looks_like_xbrl_noise(text):
+            score -= 50000  # huge penalty if it's XBRL/linkbase junk
+
+        if score > best_score:
+            best_score = score
+            best_text = text
+
+    return best_text
+
+
+def load_best_filing_text(folder: Path) -> Tuple[Optional[str], Optional[Path]]:
+    """
+    Prefer filing-details.html. If missing, fallback to full-submission.txt with robust selection.
+    Returns: (text, source_path_used)
+    """
+    html_path = folder / "filing-details.html"
+    if html_path.exists():
+        html = read_text(html_path)
+        text = html_to_text(html)
+        # If somehow it's junk, fallback
+        if text and not looks_like_xbrl_noise(text):
+            return text, html_path
+
+    txt_path = folder / "full-submission.txt"
+    if txt_path.exists():
+        full_submission = read_text(txt_path)
+        text = extract_best_10k_text_from_full_submission(full_submission)
+        if text:
+            return text, txt_path
+
+    return None, None
+
+
 # =============================================================================
-# SECTION 2 — ROBUST ITEM HEADING DETECTION (FIXED)
+# SECTION 2 — ROBUST ITEM HEADING DETECTION
 # =============================================================================
 
-# Handles:
-# ITEM 1A. RISK FACTORS
-# ITEM 1A—RISK FACTORS
-# ITEM 1A: RISK FACTORS
-# ITEM 1A.
-# (RISK FACTORS on next line)
 ITEM_LINE_RE = re.compile(
     r"""(?ix)^\s*
     item
@@ -111,11 +191,6 @@ TITLE_LINE_RE = re.compile(r"(?i)^[A-Z][A-Z \-&/,]{4,}$")
 
 
 def split_into_items(full_text: str) -> List[Tuple[str, str]]:
-    """
-    Line-based robust section splitter.
-    """
-
-    # Normalize unicode artifacts
     text = (full_text
             .replace("\u2013", "-")
             .replace("\u2014", "-")
@@ -140,7 +215,6 @@ def split_into_items(full_text: str) -> List[Tuple[str, str]]:
             item_num = m.group(1).upper()
             title = (m.group(2) or "").strip()
 
-            # If title missing, check next line
             if not title and i + 1 < len(lines):
                 nxt = lines[i + 1].strip()
                 if TITLE_LINE_RE.match(nxt):
@@ -178,25 +252,8 @@ def chunk_with_overlap(
     max_para_chars: int = 6000,
     max_chunk_chars: int = 12000
 ) -> List[str]:
-    """
-    Paragraph chunking with overlap AND hard caps to prevent embedding context errors.
-
-    Why we need hard caps:
-    - EDGAR text often contains giant table-like “paragraphs” with no blank lines.
-    - Those can create mega-chunks that exceed embedding model limits (8192 tokens).
-    - We cap paragraph size, then cap final chunk size.
-
-    Parameters
-    ----------
-    max_para_chars:
-        If a paragraph exceeds this, we split it into pieces.
-    max_chunk_chars:
-        If a final chunk exceeds this, we split it into pieces.
-    """
-    # Split into paragraphs by blank lines
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
 
-    # 1) Split giant paragraphs (tables / messy HTML text often becomes a single huge paragraph)
     fixed_paras: List[str] = []
     for p in paragraphs:
         if len(p) <= max_para_chars:
@@ -204,7 +261,6 @@ def chunk_with_overlap(
         else:
             for i in range(0, len(p), max_para_chars):
                 fixed_paras.append(p[i:i + max_para_chars])
-
     paragraphs = fixed_paras
 
     chunks: List[str] = []
@@ -213,14 +269,12 @@ def chunk_with_overlap(
     def current_tokens() -> int:
         return approx_token_count("\n\n".join(current))
 
-    # 2) Build chunks up to target size
     for p in paragraphs:
         current.append(p)
 
         if current_tokens() >= target_tokens:
             chunks.append("\n\n".join(current).strip())
 
-            # overlap: keep tail paragraphs until overlap size met
             overlap: List[str] = []
             for para in reversed(current):
                 overlap.insert(0, para)
@@ -231,7 +285,6 @@ def chunk_with_overlap(
     if current:
         chunks.append("\n\n".join(current).strip())
 
-    # 3) Hard-split chunks that are still too big
     safe_chunks: List[str] = []
     for c in chunks:
         if len(c) <= max_chunk_chars:
@@ -240,7 +293,6 @@ def chunk_with_overlap(
             for i in range(0, len(c), max_chunk_chars):
                 safe_chunks.append(c[i:i + max_chunk_chars])
 
-    # 4) Drop tiny fragments
     safe_chunks = [c for c in safe_chunks if len(c.strip()) > 200]
     return safe_chunks
 
@@ -264,15 +316,6 @@ def build_chunks(doc_text: str) -> List[Dict[str, Any]]:
 # =============================================================================
 # SECTION 3 — EMBEDDINGS + CHROMA
 # =============================================================================
-def force_split_for_embedding(text: str, max_chars: int = 12000) -> List[str]:
-    """
-    Absolute last-resort safety.
-    If ANY chunk is still too large, split it before sending to embeddings API.
-    """
-    if len(text) <= max_chars:
-        return [text]
-    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
-
 def _is_rate_limit_error(e: Exception) -> bool:
     msg = str(e).lower()
     return ("rate limit" in msg) or ("429" in msg) or ("tpm" in msg)
@@ -343,62 +386,42 @@ def main():
     collection = client.get_or_create_collection(name="tenk_chunks")
 
     total_chunks = 0
+    batch_size = 8
 
     for folder in tqdm(filing_folders, desc="Indexing filings"):
         try:
-            txt_path = folder / "full-submission.txt"
-            if not txt_path.exists():
+            text, source_path = load_best_filing_text(folder)
+            if not text or not source_path:
+                continue
+
+            # Extra safety: if the chosen text is XBRL-junk, skip
+            if looks_like_xbrl_noise(text):
                 continue
 
             meta = parse_metadata_from_folder(folder)
-            full_submission = load_full_submission_text(txt_path)
-            doc_block = extract_document_block(full_submission)
-            if not doc_block:
-                continue
-
-            text = extract_text_from_document_block(doc_block)
             chunks = build_chunks(text)
-
-            batch_size = 8
+            if not chunks:
+                continue
 
             for i in range(0, len(chunks), batch_size):
                 batch = chunks[i:i + batch_size]
-                # Collect texts, but apply an absolute safety split before embedding
-                texts: List[str] = []
-                expanded_batch: List[Dict[str, Any]] = []
-
-                for b in batch:
-                    parts = force_split_for_embedding(b["text"], max_chars=12000)
-                    for pi, part in enumerate(parts):
-                        # copy chunk metadata, but add a "part" index so IDs stay unique
-                        bb = dict(b)
-                        bb["chunk_part"] = pi
-                        bb["text"] = part
-                        expanded_batch.append(bb)
-                        texts.append(part)
+                texts = [b["text"] for b in batch]
 
                 embeddings = embed_with_retry(oai, EMBED_MODEL, texts)
 
-                ids = [f"{meta['doc_id']}__{i + j}__p{expanded_batch[j].get('chunk_part', 0)}" for j in
-                       range(len(expanded_batch))]
+                ids = [
+                    f"{meta['doc_id']}__{i + j}"
+                    for j in range(len(batch))
+                ]
 
                 metadatas = []
-                for b in expanded_batch:
+                for b in batch:
                     metadatas.append({
                         **meta,
                         "item_heading": b["item_heading"],
                         "chunk_index": b["chunk_index"],
-                        "chunk_part": b.get("chunk_part", 0),
-                        "source_path": str(txt_path)
+                        "source_path": str(source_path),
                     })
-
-                collection.upsert(
-                    ids=ids,
-                    documents=texts,
-                    metadatas=metadatas,
-                    embeddings=embeddings
-                )
-                total_chunks += len(expanded_batch)
 
                 collection.upsert(
                     ids=ids,

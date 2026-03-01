@@ -5,46 +5,21 @@ STREAMLIT_APP.PY
 
 PURPOSE
 -------
-This file provides the FRONTEND / USER INTERFACE for the 10-K RAG chatbot.
+Frontend / UI for the 10-K RAG chatbot.
 
-It uses Streamlit's chat components to create a conversational UI and calls the
-RAG pipeline functions (implemented in rag_core.py) to produce answers grounded
-in SEC 10-K filings, with source citations.
-
-WHAT THIS UI DOES (PER USER MESSAGE)
-------------------------------------
-1) Store the user message in conversation memory (session_state)
-2) Rewrite the query using conversation history (helps follow-ups)
-3) Embed the rewritten query (OpenAI embeddings)
-4) Retrieve candidate chunks from Chroma (semantic vector search)
-5) Section-aware filtering (metadata-aware): prioritize the right 10-K sections
-6) Advanced feature: re-rank candidates down to top-5 using an LLM
-7) Generate an answer using ONLY those top-5 chunks (with citations like [1][2])
-8) Display citations so the user can inspect the evidence
-
-WHY THIS VERSION IS "CLEANER / MORE ADVANCED"
----------------------------------------------
-Pure embedding search can surface broad sections (e.g., "Item 1. Business")
-even when the user asks about a specific section (e.g., "Item 1A. Risk Factors").
-
-We improve precision using a *metadata-aware routing layer*:
-
-- First: retrieve a larger semantic pool (fast + recall-focused)
-- Second: filter locally by metadata (precision-focused, version-proof)
-- Third: fall back to global results if filtering is too strict
-
-This avoids Chroma version issues around `where` operators and keeps the app stable.
+- Streamlit chat UI
+- Calls RAG pipeline functions from rag_core.py
+- Shows citations used for answers
 
 ===============================================================================
 """
 
 import os
 import re
+import base64
 from typing import List, Dict, Any
-import streamlit.components.v1 as components
 
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 from rag_core import (
@@ -58,7 +33,7 @@ from rag_core import (
     answer_with_citations,
 )
 
-# Company Names
+# Maps stock tickers to company display names used in the UI.
 COMPANY_NAMES = {
     "EW": "Edwards Lifesciences",
     "MDT": "Medtronic",
@@ -69,72 +44,214 @@ COMPANY_NAMES = {
     "ZBH": "Zimmer Biomet",
     "ALGN": "Align Technology",
     "PODD": "Insulet",
-    "DXCM": "Dexcom"
+    "DXCM": "Dexcom",
 }
 
-# =============================================================================
-# UI CONFIGURATION + SESSION STATE INITIALIZATION
-# =============================================================================
 
+# =============================================================================
+# SESSION STATE
+# =============================================================================
 def init_session_state():
-    """
-    Initialize Streamlit session_state variables.
-    """
+    """Initializes Streamlit session variables used for chat history, citations, and sidebar selections."""
     if "history" not in st.session_state:
         st.session_state.history = []
 
     if "last_citations" not in st.session_state:
         st.session_state.last_citations = []
 
-    if "debug" not in st.session_state:
-        st.session_state.debug = False
+    if "allowed_tickers" not in st.session_state:
+        st.session_state.allowed_tickers = []  # [] means no filter (all companies)
 
 
+# =============================================================================
+# SIDEBAR
+# =============================================================================
 def render_sidebar():
-    """
-    Sidebar controls:
-      - show configured models
-      - enable debug view
-      - clear chat
-    """
-    st.sidebar.header("Settings")
+    """Renders the sidebar UI (logo, New chat button, and company filter) and applies sidebar CSS styling."""
+    icon_base64 = ""
+    if os.path.exists("10k.png"):
+        with open("10k.png", "rb") as f:
+            icon_base64 = base64.b64encode(f.read()).decode()
 
-    embed_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-    gen_model = os.getenv("GEN_MODEL", "gpt-4o-mini")
+    st.sidebar.markdown(
+        f"""
+    <style>
+      /* Sidebar width in collapsed mode */
+      section[data-testid="stSidebar"][aria-expanded="false"]{{
+        width: 100px !important;
+        min-width: 100px !important;
+        max-width: 100px !important;
+        overflow: visible !important;
+        transform: none !important;
+      }}
 
-    st.sidebar.write("**Embedding model:**", embed_model)
-    st.sidebar.write("**Generation model:**", gen_model)
+      /* Logo container at the top of the sidebar */
+      .top-left-icon {{
+        position: sticky;
+        top: 6px;
+        left: 6px;
+        z-index: 9999;
+        margin: 0 0 16px 0;
+        width: 100%;
+        display: flex;
+        justify-content: flex-start;
+        align-items: center;
+        box-sizing: border-box;
+      }}
 
-    st.sidebar.divider()
+      .top-left-icon img {{
+        width: 78px;
+        height: 78px;
+        object-fit: contain;
+        display: block;
+      }}
 
-    st.session_state.debug = st.sidebar.checkbox(
-        "Show debug info",
-        value=st.session_state.debug
+      /* Keep the logo visible and sized to fit when the sidebar is collapsed */
+      section[data-testid="stSidebar"][aria-expanded="false"] .top-left-icon {{
+        justify-content: center;
+      }}
+      section[data-testid="stSidebar"][aria-expanded="false"] .top-left-icon img {{
+        width: 54px;
+        height: 54px;
+      }}
+
+      /* Hide sidebar text/content when collapsed */
+      section[data-testid="stSidebar"][aria-expanded="false"] .nav-label {{ display:none !important; }}
+      section[data-testid="stSidebar"][aria-expanded="false"] .stMarkdown,
+      section[data-testid="stSidebar"][aria-expanded="false"] label,
+      section[data-testid="stSidebar"][aria-expanded="false"] small {{ display:none !important; }}
+
+      /* Show the markdown block that contains the logo even when collapsed */
+      section[data-testid="stSidebar"][aria-expanded="false"] .stMarkdown:has(.top-left-icon) {{
+        display: block !important;
+      }}
+
+      /* Hide the company expander/selectbox when collapsed */
+      section[data-testid="stSidebar"][aria-expanded="false"] details,
+      section[data-testid="stSidebar"][aria-expanded="false"] details * {{
+        display: none !important;
+      }}
+      section[data-testid="stSidebar"][aria-expanded="false"] div[data-testid="stSelectbox"],
+      section[data-testid="stSidebar"][aria-expanded="false"] div[data-testid="stSelectbox"] * {{
+        display: none !important;
+      }}
+      section[data-testid="stSidebar"][aria-expanded="false"] .company-expander {{
+        display: none !important;
+      }}
+
+      /* Fix icon button sizing so it stays consistent in both modes */
+      section[data-testid="stSidebar"] div[data-testid="stButton"]{{
+        width: 52px !important;
+        min-width: 52px !important;
+        max-width: 52px !important;
+      }}
+
+      section[data-testid="stSidebar"] div[data-testid="stButton"] > button{{
+        width: 52px !important;
+        height: 52px !important;
+        min-width: 52px !important;
+        min-height: 52px !important;
+        max-width: 52px !important;
+        max-height: 52px !important;
+
+        padding: 0 !important;
+        border-radius: 14px !important;
+        border: 1px solid rgba(0,0,0,0.10) !important;
+        background: #fff !important;
+
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+
+        font-size: 20px !important;
+        line-height: 1 !important;
+        box-sizing: border-box !important;
+      }}
+
+      section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="column"]{{
+        min-width: 80px !important;
+        width: 80px !important;
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
+      }}
+
+      section[data-testid="stSidebar"][aria-expanded="false"] .block-container{{
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+      }}
+
+      .nav-label{{
+        font-size: 16px;
+        line-height: 1;
+        padding-top: 2px;
+      }}
+    </style>
+
+    <div class="top-left-icon">
+        {"<img src='data:image/png;base64," + icon_base64 + "'>" if icon_base64 else ""}
+    </div>
+    """,
+        unsafe_allow_html=True,
     )
 
-    if st.sidebar.button("Clear chat"):
+    # Sidebar action: clears chat state and reruns the app.
+    c1, c2 = st.sidebar.columns([1, 4], vertical_alignment="center")
+    with c1:
+        new_chat_clicked = st.button("✎", key="newchat_icon_only")
+    with c2:
+        st.markdown('<div class="nav-label">New chat</div>', unsafe_allow_html=True)
+
+    if new_chat_clicked:
         st.session_state.history = []
         st.session_state.last_citations = []
         st.rerun()
 
+    # Sidebar filter: allows selecting one company ticker to constrain retrieval.
+    c3, c4 = st.sidebar.columns([1, 4], vertical_alignment="center")
+    with c3:
+        st.button("▦", key="company_icon_only")
+    with c4:
+        st.markdown('<div class="nav-label">Company</div>', unsafe_allow_html=True)
+
+    company_options = ["All companies"] + [
+        f"{t} — {COMPANY_NAMES[t]}" for t in COMPANY_NAMES.keys()
+    ]
+
+    st.sidebar.markdown('<div class="company-expander">', unsafe_allow_html=True)
+    with st.sidebar.expander("Company filter", expanded=True):
+        selected_company_label = st.selectbox(
+            "Select ONE company (optional)",
+            options=company_options,
+            index=0,
+            key="company_select",
+        )
+    st.sidebar.markdown("</div>", unsafe_allow_html=True)
+
+    if selected_company_label == "All companies":
+        st.session_state.allowed_tickers = []
+    else:
+        selected_ticker = selected_company_label.split(" — ")[0].strip()
+        st.session_state.allowed_tickers = [selected_ticker]
+
 
 # =============================================================================
-# SECTION-AWARE RETRIEVAL (CLEAN + VERSION-PROOF)
+# SECTION-AWARE RETRIEVAL
 # =============================================================================
-
 def infer_section_preferences(query: str) -> Dict[str, Any]:
-    """
-    Infer what section(s) the user likely wants, based on the rewritten query.
-    """
+    """Detects if the query likely targets specific 10-K sections (e.g., Risk Factors) and returns filter hints."""
     q = query.lower()
-
     risk_signals = [
-        "risk", "risk factor", "risks", "uncertaint", "litigation",
-        "regulatory risk", "compliance risk"
+        "risk",
+        "risk factor",
+        "risks",
+        "uncertaint",
+        "litigation",
+        "regulatory risk",
+        "compliance risk",
     ]
     if any(s in q for s in risk_signals):
         return {"item_heading_contains_any": ["ITEM 1A", "RISK FACTORS"]}
-
     return {}
 
 
@@ -143,15 +260,16 @@ def section_aware_retrieve(
     query_emb: List[float],
     preferences: Dict[str, Any],
     final_n: int = 20,
-    initial_pool: int = 80
+    initial_pool: int = 80,
+    allowed_tickers: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Two-step retrieve:
-      A) Retrieve big pool from Chroma
-      B) Locally filter by metadata if preferences exist
-      C) Fallback to global top-N
-    """
-    big_pool = retrieve_top_n(collection, query_emb, n=initial_pool)
+    """Retrieves an initial semantic pool, optionally filters by section hints, and returns the top results."""
+    big_pool = retrieve_top_n(
+        collection,
+        query_emb,
+        n=initial_pool,
+        allowed_tickers=allowed_tickers or [],
+    )
 
     if not preferences:
         return big_pool[:final_n]
@@ -171,198 +289,50 @@ def section_aware_retrieve(
 
 
 # =============================================================================
-# CHATGPT-LIKE "SCROLL TO LATEST" ARROW
-# =============================================================================
-
-def render_scroll_to_latest_arrow():
-    """
-    ChatGPT-like 'scroll to latest' arrow:
-    - Appears only when user scrolls up (not near bottom)
-    - Disappears when user is near bottom
-    - Click jumps smoothly to latest (bottom anchor)
-    """
-
-    # Anchor should be in the main DOM near the bottom
-    st.markdown('<div id="chat-bottom"></div>', unsafe_allow_html=True)
-
-    components.html(
-        """
-        <script>
-        (function() {
-          const P = window.parent.document;
-
-          // Don't duplicate across reruns
-          if (P.getElementById("scrollToBottomBtn")) return;
-
-          // --- Find the actual Streamlit scroll container ---
-          function getScrollContainer() {
-            return (
-              P.querySelector('div[data-testid="stAppViewContainer"]') ||
-              P.querySelector('section.main') ||
-              P.documentElement
-            );
-          }
-
-          // --- Styles ---
-          const style = P.createElement("style");
-          style.innerHTML = `
-            #scrollToBottomBtn{
-              all: unset;
-              position: fixed;
-              right: 28px;
-              bottom: 86px; /* above chat input */
-              z-index: 200;
-
-              width: 44px;
-              height: 44px;
-              border-radius: 999px;
-
-              display: none;
-              align-items: center;
-              justify-content: center;
-
-              background: rgba(255,255,255,0.95);
-              border: 1px solid rgba(0,0,0,0.12);
-              box-shadow: 0 6px 18px rgba(0,0,0,0.15);
-              cursor: pointer;
-            }
-
-            #scrollToBottomBtn:hover{
-              box-shadow: 0 8px 22px rgba(0,0,0,0.18);
-              transform: translateY(-1px);
-            }
-
-            #scrollToBottomBtn svg{
-              width: 18px;
-              height: 18px;
-              opacity: 0.75;
-            }
-          `;
-          P.head.appendChild(style);
-
-          // --- Button ---
-          const btn = P.createElement("button");
-          btn.id = "scrollToBottomBtn";
-          btn.setAttribute("aria-label","Jump to latest");
-          btn.title = "Jump to latest";
-          btn.innerHTML = `
-            <svg viewBox="0 0 24 24" fill="none">
-              <path d="M6 9l6 6 6-6"
-                stroke="currentColor"
-                stroke-width="2.2"
-                stroke-linecap="round"
-                stroke-linejoin="round"/>
-            </svg>
-          `;
-          P.body.appendChild(btn);
-
-          function getAnchor() {
-            return P.getElementById("chat-bottom");
-          }
-
-          // Click => scroll anchor into view
-          btn.addEventListener("click", () => {
-            const anchor = getAnchor();
-            if (anchor) anchor.scrollIntoView({ behavior: "smooth", block: "end" });
-          });
-
-          // Show/hide based on how close user is to bottom
-          function updateVisibility() {
-            const sc = getScrollContainer();
-            const threshold = 250; // px from bottom
-            const nearBottom = (sc.scrollHeight - (sc.scrollTop + sc.clientHeight)) < threshold;
-            btn.style.display = nearBottom ? "none" : "flex";
-          }
-
-          // Attach scroll listener to the correct container
-          const sc = getScrollContainer();
-
-          // Some Streamlit builds need a tiny delay before sizes are correct
-          let ticking = false;
-          function onScroll() {
-            if (!ticking) {
-              ticking = true;
-              requestAnimationFrame(() => {
-                updateVisibility();
-                ticking = false;
-              });
-            }
-          }
-
-          sc.addEventListener("scroll", onScroll, { passive: true });
-          window.parent.addEventListener("resize", updateVisibility);
-
-          // Initial
-          setTimeout(updateVisibility, 400);
-          setTimeout(updateVisibility, 1200);
-        })();
-        </script>
-        """,
-        height=1,
-    )
-
-
-# =============================================================================
 # MAIN APP
 # =============================================================================
-
 def main():
-    """
-    Main Streamlit application entry point.
-    """
+    """Runs the Streamlit app: renders UI, processes chat input, retrieves context, generates answers, and displays sources."""
     load_dotenv()
-
     st.set_page_config(page_title="MedTech 10-K Explorer", layout="wide")
 
-    # --- Fixed header that automatically shifts when sidebar opens/closes ---
-    # --- Proper fixed header that respects sidebar ---
-    st.markdown("""
+    st.markdown(
+        """
     <style>
+      :root { --st-topbar-h: 3.25rem; }
 
-    /* Streamlit top toolbar height (approx). If you still see clipping, change 3.25rem -> 3.5rem */
-    :root { --st-topbar-h: 3.25rem; }
+      .fixed-header {
+        position: fixed;
+        top: var(--st-topbar-h);
+        left: 260px;
+        right: 0;
+        background: white;
+        border-bottom: 1px solid rgba(0,0,0,0.08);
+        padding: 15px 40px 16px 50px;
+        z-index: 9999;
+        transition: left 0.25s ease;
+      }
 
-    /* Header container */
-    .fixed-header {
-      position: fixed;
-      top: var(--st-topbar-h);     /* ✅ push below Streamlit toolbar */
-      left: 260px;                 /* sidebar open width */
-      right: 0;
+      section[data-testid="stSidebar"][aria-expanded="false"] ~ div .fixed-header {
+        left: 100px;
+      }
 
-      background: white;
-      border-bottom: 1px solid rgba(0,0,0,0.08);
+      .fixed-header .title {
+        font-size: 28px;
+        font-weight: 750;
+        line-height: 1.15;
+        margin: 0;
+      }
 
-      padding: 15px 40px 16px 50px;
-      z-index: 9999;
+      .fixed-header .subtitle {
+        font-size: 13px;
+        color: #666;
+        margin-top: 6px;
+      }
 
-      transition: left 0.25s ease;
-    }
-
-    /* When sidebar is collapsed */
-    section[data-testid="stSidebar"][aria-expanded="false"] ~ div .fixed-header {
-      left: 80px;
-    }
-
-    /* Title */
-    .fixed-header .title {
-      font-size: 28px;
-      font-weight: 750;
-      line-height: 1.15;
-      margin: 0;
-    }
-
-    /* Subtitle */
-    .fixed-header .subtitle {
-      font-size: 13px;
-      color: #666;
-      margin-top: 6px;
-    }
-
-    /* Push page content down so it doesn't hide under the fixed header */
-    .block-container {
-      padding-top: calc(var(--st-topbar-h) + 110px) !important;
-    }
-
+      .block-container {
+        padding-top: calc(var(--st-topbar-h) + 110px) !important;
+      }
     </style>
 
     <div class="fixed-header">
@@ -371,43 +341,9 @@ def main():
         Ask questions about medical device companies’ SEC 10-K filings — answers include citations.
       </div>
     </div>
-    """, unsafe_allow_html=True)
-
-    # JS to measure sidebar width and update --sidebar-w whenever it changes
-    components.html("""
-    <script>
-    (function () {
-      const P = window.parent.document;
-
-      function sidebarWidthPx() {
-        const sidebar = P.querySelector('section[data-testid="stSidebar"]');
-        if (!sidebar) return 0;
-        const rect = sidebar.getBoundingClientRect();
-        // When collapsed, rect.width becomes ~0 (or very small)
-        return Math.max(0, Math.round(rect.width));
-      }
-
-      function update() {
-        const w = sidebarWidthPx();
-        P.documentElement.style.setProperty("--sidebar-w", w + "px");
-      }
-
-      // Run now + after layout settles
-      setTimeout(update, 50);
-      setTimeout(update, 300);
-      setTimeout(update, 800);
-
-      // Update on resize
-      window.parent.addEventListener("resize", update);
-
-      // Update after any click (covers sidebar collapse/expand button)
-      P.addEventListener("click", () => setTimeout(update, 50), true);
-
-      // Also update on scroll (some layouts shift sizes)
-      P.addEventListener("scroll", () => requestAnimationFrame(update), true);
-    })();
-    </script>
-    """, height=0)
+    """,
+        unsafe_allow_html=True,
+    )
 
     init_session_state()
     render_sidebar()
@@ -415,7 +351,6 @@ def main():
     EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
     GEN_MODEL = os.getenv("GEN_MODEL", "gpt-4o-mini")
 
-    # Initialize clients
     try:
         oai = get_openai_client()
     except Exception as e:
@@ -428,10 +363,10 @@ def main():
         st.error(f"Chroma database initialization failed: {e}")
         st.stop()
 
-    # Show welcome message if chat is empty
     if len(st.session_state.history) == 0:
         with st.chat_message("assistant"):
-            st.markdown("""
+            st.markdown(
+                """
 **👋 Welcome to the Med Device 10-K Chatbot!**
 
 You can ask questions about medical device companies’ SEC 10-K filings.
@@ -443,142 +378,202 @@ Examples:
 - What products does Dexcom make?
 
 All answers are based on official SEC Form 10-K filings and include source citations.
-""")
+"""
+            )
 
-    # Display chat history
     for msg in st.session_state.history:
         with st.chat_message(msg["role"]):
-            st.write(msg["content"])
+            st.markdown(msg["content"])
 
-    # ✅ Render the arrow AFTER the history is drawn, BEFORE input
-    render_scroll_to_latest_arrow()
-
-    # Chat input
-    user_msg = st.chat_input("Ask a question (e.g., 'Compare risk factors for Edwards Lifesciences vs Medtronic')")
+    user_msg = st.chat_input(
+        "Ask a question (e.g., 'Compare risk factors for Edwards Lifesciences vs Medtronic')"
+    )
     if not user_msg:
         return
 
-    # Step 1: store + show user message
+    # Save + display user message
     st.session_state.history.append({"role": "user", "content": user_msg})
     with st.chat_message("user"):
         st.write(user_msg)
 
-    # Step 2: rewrite query (multi-turn support)
     rewritten_query = rewrite_query(
         oai=oai,
         gen_model=GEN_MODEL,
         history=st.session_state.history,
-        user_msg=user_msg
+        user_msg=user_msg,
     )
 
-    # Step 3: embed + retrieve candidates (section-aware)
     try:
         qemb = embed_query(oai, EMBED_MODEL, rewritten_query)
         preferences = infer_section_preferences(rewritten_query)
+        allowed_tickers = st.session_state.get("allowed_tickers", [])
 
         candidates = section_aware_retrieve(
             collection=col,
             query_emb=qemb,
             preferences=preferences,
             final_n=20,
-            initial_pool=80
+            initial_pool=80,
+            allowed_tickers=allowed_tickers,
         )
-
     except Exception as e:
         st.error(f"Retrieval failed: {e}")
         st.stop()
 
     if not candidates:
         answer = "I couldn't find relevant passages in the indexed 10-K filings."
-        st.session_state.history.append({"role": "assistant", "content": answer})
-        with st.chat_message("assistant"):
-            st.write(answer)
-        return
-
-    # Step 4: advanced feature rerank top-20 -> top-5
-    try:
-        top5 = rerank_with_llm(oai, GEN_MODEL, rewritten_query, candidates, k=5)
-    except Exception:
-        top5 = candidates[:5]
-
-    # Step 5: context + citations
-    context, citations = format_context_blocks(top5)
-    st.session_state.last_citations = citations
-
-    # Step 6 + 7: generate answer ONCE, show typing, then show sources
-    with st.chat_message("assistant"):
-        typing_placeholder = st.empty()
-
-        typing_placeholder.markdown("""
-<div style="display:flex; gap:6px; align-items:center;">
-    <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-</div>
-
-<style>
-.dot {
-    height:10px;
-    width:10px;
-    background-color:#888;
-    border-radius:50%;
-    display:inline-block;
-    animation:bounce 1.4s infinite ease-in-out;
-}
-.dot:nth-child(2) { animation-delay:0.2s; }
-.dot:nth-child(3) { animation-delay:0.4s; }
-
-@keyframes bounce {
-    0%, 80%, 100% { transform: scale(0); }
-    40% { transform: scale(1); }
-}
-</style>
-""", unsafe_allow_html=True)
-
-        # Generate answer
-        try:
-            answer = answer_with_citations(
-                oai=oai,
-                gen_model=GEN_MODEL,
-                history=st.session_state.history,
-                user_msg=user_msg,
-                context=context
-            )
-        except Exception as e:
-            answer = f"Answer generation failed: {e}"
-
-        typing_placeholder.empty()
-
-        # Show answer once
-        st.write(answer)
-
-        # Show sources once (deduped)
-        st.subheader("Sources (Evidence Used)")
+        # Build a single markdown string that includes the answer + sources
+        sources_lines = []
         seen = set()
         for c in citations:
-            ticker = c["ticker"]
+            ticker = c.get("ticker", "")
             company = COMPANY_NAMES.get(ticker, ticker)
 
-            match = re.search(r"-(\d{2})-", c["source_path"])
+            match = re.search(r"-(\d{2})-", str(c.get("source_path", "")))
             year = "20" + match.group(1) if match else "Unknown"
-            section = c["section"]
+
+            section = c.get("section", "Unknown section")
+            marker = c.get("marker", "?")
 
             doc_key = (ticker, year)
             if doc_key in seen:
                 continue
             seen.add(doc_key)
 
-            st.write(f"[{c['marker']}] {company} — {year} Form 10-K — {section}")
+            sources_lines.append(f"- [{marker}] {company} — {year} Form 10-K — {section}")
 
-        # Debug panel (optional)
-        if st.session_state.debug:
-            st.divider()
-            st.markdown("### Debug Info")
-            st.write("**Rewritten query:**", rewritten_query)
-            st.write("**Section preferences:**", preferences if "preferences" in locals() else {})
-            st.write("**Retrieved candidates:**", len(candidates))
-            st.write("**Reranked to:**", len(top5))
+        assistant_full = answer
+        if sources_lines:
+            assistant_full += "\n\n---\n\n**Sources (Evidence Used)**\n" + "\n".join(sources_lines)
 
-    # ✅ Store assistant message ONCE for history
-    st.session_state.history.append({"role": "assistant", "content": answer})
+        st.session_state.history.append({"role": "assistant", "content": assistant_full})
+        with st.chat_message("assistant"):
+            st.write(answer)
+        return
+
+    try:
+        top5 = rerank_with_llm(oai, GEN_MODEL, rewritten_query, candidates, k=5)
+    except Exception:
+        top5 = candidates[:5]
+
+    context, citations = format_context_blocks(top5)
+    st.session_state.last_citations = citations
+
+    # Generate + display assistant answer
+    with st.chat_message("assistant"):
+
+        typing_placeholder = st.empty()
+        typing_placeholder.markdown(
+            """
+<div style="display:flex; gap:6px; align-items:center;">
+  <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+</div>
+
+<style>
+.dot {
+  height:10px;
+  width:10px;
+  background-color:#888;
+  border-radius:50%;
+  display:inline-block;
+  animation:bounce 1.4s infinite ease-in-out;
+}
+.dot:nth-child(2) { animation-delay:0.2s; }
+.dot:nth-child(3) { animation-delay:0.4s; }
+
+@keyframes bounce {
+  0%, 80%, 100% { transform: scale(0); }
+  40% { transform: scale(1); }
+}
+</style>
+""",
+            unsafe_allow_html=True,
+        )
+
+        try:
+            answer = answer_with_citations(
+                oai=oai,
+                gen_model=GEN_MODEL,
+                history=st.session_state.history,
+                user_msg=user_msg,
+                context=context,
+            )
+        except Exception as e:
+            answer = f"Answer generation failed: {e}"
+
+        typing_placeholder.empty()
+        st.write(answer)
+
+        st.subheader("Sources (Evidence Used)")
+        seen = set()
+        for c in citations:
+            ticker = c.get("ticker", "")
+            company = COMPANY_NAMES.get(ticker, ticker)
+
+            match = re.search(r"-(\d{2})-", str(c.get("source_path", "")))
+            year = "20" + match.group(1) if match else "Unknown"
+
+            section = c.get("section", "Unknown section")
+            marker = c.get("marker", "?")
+
+            doc_key = (ticker, year)
+            if doc_key in seen:
+                continue
+            seen.add(doc_key)
+
+            st.write(f"[{marker}] {company} — {year} Form 10-K — {section}")
+
+    # Save answer
+    sources_lines = []
+    seen = set()
+
+    for c in citations:
+        ticker = c.get("ticker", "")
+        company = COMPANY_NAMES.get(ticker, ticker)
+
+        match = re.search(r"-(\d{2})-", str(c.get("source_path", "")))
+        year = "20" + match.group(1) if match else "Unknown"
+
+        section = c.get("section", "Unknown section")
+        marker = c.get("marker", "?")
+
+        doc_key = (ticker, year)
+        if doc_key in seen:
+            continue
+        seen.add(doc_key)
+
+        sources_lines.append(f"- [{marker}] {company} — {year} Form 10-K — {section}")
+
+    assistant_full = answer
+    if sources_lines:
+        assistant_full += "\n\n---\n\n**Sources (Evidence Used)**\n" + "\n".join(sources_lines)
+
+    # Save answer + sources together so they persist in history
+    sources_lines = []
+    seen = set()
+
+    for c in citations:
+        ticker = c.get("ticker", "")
+        company = COMPANY_NAMES.get(ticker, ticker)
+
+        match = re.search(r"-(\d{2})-", str(c.get("source_path", "")))
+        year = "20" + match.group(1) if match else "Unknown"
+
+        section = c.get("section", "Unknown section")
+        marker = c.get("marker", "?")
+
+        doc_key = (ticker, year)
+        if doc_key in seen:
+            continue
+        seen.add(doc_key)
+
+        sources_lines.append(f"- [{marker}] {company} — {year} Form 10-K — {section}")
+
+    assistant_full = answer
+    if sources_lines:
+        assistant_full += "\n\n---\n\n**Sources (Evidence Used)**\n" + "\n".join(sources_lines)
+
+    st.session_state.history.append({"role": "assistant", "content": assistant_full})
 
 
 if __name__ == "__main__":
