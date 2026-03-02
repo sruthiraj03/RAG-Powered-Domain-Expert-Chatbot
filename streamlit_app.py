@@ -488,33 +488,17 @@ All answers are based on official SEC Form 10-K filings and include source citat
 
     if not candidates:
         answer = "I couldn't find relevant passages in the indexed 10-K filings."
-        # Build a single markdown string that includes the answer + sources
-        sources_lines = []
-        seen = set()
-        for c in citations:
-            ticker = c.get("ticker", "")
-            company = COMPANY_NAMES.get(ticker, ticker)
 
-            match = re.search(r"-(\d{2})-", str(c.get("source_path", "")))
-            year = "20" + match.group(1) if match else "Unknown"
-
-            section = c.get("section", "Unknown section")
-            marker = c.get("marker", "?")
-
-            doc_key = (ticker, year)
-            if doc_key in seen:
-                continue
-            seen.add(doc_key)
-
-            sources_lines.append(f"- [{marker}] {company} — {year} Form 10-K — {section}")
-
-        assistant_full = answer
-        if sources_lines:
-            assistant_full += "\n\n---\n\n**Sources (Evidence Used)**\n" + "\n".join(sources_lines)
+        # No retrieval results => no citations
+        assistant_full = answer + "\n\n---\n\n**Sources (Evidence Used)**\n- None (no relevant chunks retrieved)"
 
         st.session_state.history.append({"role": "assistant", "content": assistant_full})
+
         with st.chat_message("assistant"):
-            st.write(answer)
+            st.markdown(answer)
+            st.subheader("Sources (Evidence Used)")
+            st.write("None (no relevant chunks retrieved)")
+
         return
 
     try:
