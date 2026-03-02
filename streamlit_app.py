@@ -286,7 +286,51 @@ def section_aware_retrieve(
         return filtered[:final_n]
 
     return big_pool[:final_n]
+# =============================================================================
+# Build reverse lookup: company name -> ticker (lowercased)
+# =============================================================================
 
+COMPANY_NAME_TO_TICKER = {v.lower(): k for k, v in COMPANY_NAMES.items()}
+
+def detect_company_mentions(text: str) -> List[str]:
+    """
+    Detects which tickers are referenced in the user query.
+    Matches:
+      - explicit tickers: "SYK", "EW"
+      - company names: "Stryker", "Edwards Lifesciences"
+    Returns a list of tickers found (unique).
+    """
+    if not text:
+        return []
+
+    t = text.lower()
+    found = set()
+
+    # 1) Match tickers as whole words
+    for ticker in COMPANY_NAMES.keys():
+        if re.search(rf"\b{re.escape(ticker.lower())}\b", t):
+            found.add(ticker)
+
+    # 2) Match company names (substring match)
+    for name_lc, ticker in COMPANY_NAME_TO_TICKER.items():
+        if name_lc in t:
+            found.add(ticker)
+
+    return sorted(found)
+
+
+def build_filter_mismatch_message(active_ticker: str, requested_tickers: List[str]) -> str:
+    active_name = COMPANY_NAMES.get(active_ticker, active_ticker)
+    # Use first mentioned ticker for the message (common case: user asks about one company)
+    req = requested_tickers[0]
+    req_name = COMPANY_NAMES.get(req, req)
+
+    return (
+        f"**Company filter is set to {active_name} ({active_ticker}).**\n\n"
+        f"Your question looks like it’s about **{req_name} ({req})**.\n\n"
+        "I can only answer using the selected company’s 10-K filings right now. "
+        "Please switch the filter to the correct company (or choose **All companies**) and ask again."
+    )
 
 # =============================================================================
 # MAIN APP
@@ -395,6 +439,28 @@ All answers are based on official SEC Form 10-K filings and include source citat
     st.session_state.history.append({"role": "user", "content": user_msg})
     with st.chat_message("user"):
         st.write(user_msg)
+
+    # -------------------------------------------------------------------------
+    # COMPANY FILTER GUARDRAIL
+    # -------------------------------------------------------------------------
+    allowed_tickers = st.session_state.get("allowed_tickers", [])
+
+    # Only enforce when a single-company filter is active
+    if allowed_tickers:
+        active = allowed_tickers[0]  # your UI only allows ONE selected company
+
+        mentioned = detect_company_mentions(user_msg)
+
+        # If user mentions a different company than the active filter, block
+        # (If user doesn't mention any company, we allow it and assume it's about the selected filter.)
+        if mentioned and (active not in mentioned):
+            msg = build_filter_mismatch_message(active, mentioned)
+
+            # Save + show assistant response WITHOUT running retrieval
+            st.session_state.history.append({"role": "assistant", "content": msg})
+            with st.chat_message("assistant"):
+                st.markdown(msg)
+            return
 
     rewritten_query = rewrite_query(
         oai=oai,
