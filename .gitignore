@@ -3,6 +3,16 @@
 # Local vector DB / embeddings
 data/chroma/
 
+# Raw filings (these get huge)
+data/filings_raw/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
 # Virtual environment
 .venv/
 venv/
