@@ -401,6 +401,45 @@ def main():
         st.error(f"OpenAI client initialization failed: {e}")
         st.stop()
 
+    # -------------------------------------------------------------------------
+    # AUTO-BUILD INDEX ON FIRST RUN (for Streamlit Cloud)
+    # -------------------------------------------------------------------------
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    CHROMA_DIR = os.getenv("CHROMA_DIR", "data/chroma")
+    chroma_path = Path(CHROMA_DIR)
+
+    def ensure_index_exists():
+        # If Chroma dir exists and has sqlite, assume index exists
+        sqlite_path = chroma_path / "chroma.sqlite3"
+        if sqlite_path.exists():
+            return
+
+        st.warning("Vector index not found. Building the index now (first run)...")
+
+        # Option 1: Build from already-downloaded filings (fastest if filings exist)
+        # Option 2: If filings are missing, run ingest first (slower)
+        filings_root = Path("data/filings_raw/sec-edgar-filings")
+
+        try:
+            if not filings_root.exists():
+                st.info("No filings found. Downloading 10-K filings first...")
+                subprocess.check_call([sys.executable, "ingest_download_10ks.py"])
+
+            st.info("Building Chroma index...")
+            subprocess.check_call([sys.executable, "build_index.py"])
+
+            st.success("Index build complete. Reloading app...")
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Index build failed: {e}")
+            st.stop()
+
+    ensure_index_exists()
+
     try:
         col = get_chroma_collection()
     except Exception as e:
